@@ -1,0 +1,67 @@
+name: Trial Render (1 random MIDI > 5 min)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: "Source Hugging Face dataset containing MIDI files"
+        required: false
+        default: "RdxradiTor/pianocore-subset-a-unique"
+      target_repo:
+        description: "PRIVATE Hugging Face dataset the trial MP4 is uploaded to (trial/ folder)"
+        required: false
+        default: "RdxradiTor/sus"
+      min_duration:
+        description: "Minimum MIDI length in seconds"
+        required: false
+        default: "300"
+
+jobs:
+  trial:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Build visualizer
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ffmpeg, Playwright, HF client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          pip install --no-cache-dir -r automation/requirements.txt
+          python -m playwright install chromium --with-deps
+
+      - name: Render one random long MIDI and upload to private repo
+        env:
+          PYTHONUNBUFFERED: "1"
+          FAHH_LOG_INTERVAL_S: "300"
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python automation/batch_render.py \
+            --mode trial \
+            --source-repo "${{ inputs.source_repo }}" \
+            --target-repo "${{ inputs.target_repo }}" \
+            --min-duration "${{ inputs.min_duration }}" \
+            --width 1920 --height 1200 --fps 60 --crf 10 --preset-x264 slow \
+            --report batch_state/trial_report.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trial-report
+          path: batch_state/trial_report.json
+          if-no-files-found: ignore
+          retention-days: 7

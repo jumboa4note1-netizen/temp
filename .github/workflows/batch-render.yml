@@ -1,0 +1,227 @@
+name: Parallel Lossless MIDI-to-MP4 Batch Render
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: "Source Hugging Face dataset containing MIDI files"
+        required: false
+        default: "RdxradiTor/pianocore-subset-a-unique"
+      target_repo:
+        description: "Target private Hugging Face dataset for MP4 videos (falls back to public if needed)"
+        required: false
+        default: "RdxradiTor/sus"
+      max_workers:
+        description: "Maximum parallel matrix workers"
+        required: false
+        default: "20"
+      max_runtime_seconds:
+        description: "Per-worker graceful stop threshold in seconds (default 18000s = 5h)"
+        required: false
+        default: "18000"
+      cooldown_seconds:
+        description: "Wait before automatically re-triggering continuation run (default 3600s = 1h)"
+        required: false
+        default: "3600"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      target_repo: ${{ steps.prep.outputs.target_repo }}
+      total_count: ${{ steps.prep.outputs.total_count }}
+      completed_count: ${{ steps.prep.outputs.completed_count }}
+      pending_count: ${{ steps.prep.outputs.pending_count }}
+      num_workers: ${{ steps.prep.outputs.num_workers }}
+      has_work: ${{ steps.prep.outputs.has_work }}
+      matrix: ${{ steps.prep.outputs.matrix }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies & build web visualizer
+        run: |
+          npm ci
+          npm run build
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install HF coordinator dependency
+        run: pip install --no-cache-dir huggingface_hub>=0.25.0
+
+      - name: Prepare pending work & worker matrix
+        id: prep
+        env:
+          PYTHONUNBUFFERED: "1"
+          FAHH_LOG_INTERVAL_S: "300"
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python automation/batch_render.py \
+            --mode prepare \
+            --source-repo "${{ inputs.source_repo }}" \
+            --target-repo "${{ inputs.target_repo }}" \
+            --max-workers "${{ inputs.max_workers }}" \
+            --plan batch_state/pending.json
+
+      - name: Upload built app and batch plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: batch-bundle
+          path: |
+            dist/
+            batch_state/pending.json
+          retention-days: 3
+
+  render_worker:
+    needs: prepare
+    if: needs.prepare.outputs.has_work == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard: ${{ fromJson(needs.prepare.outputs.matrix) }}
+
+    steps:
+      - name: Checkout automation scripts
+        uses: actions/checkout@v4
+
+      - name: Download built app and batch plan
+        uses: actions/download-artifact@v4
+        with:
+          name: batch-bundle
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Playwright & dependencies
+        run: |
+          pip install --no-cache-dir -r automation/requirements.txt
+          python -m playwright install chromium --with-deps
+
+      - name: Render shard ${{ matrix.shard }} (stops gracefully at 5h)
+        env:
+          PYTHONUNBUFFERED: "1"
+          FAHH_LOG_INTERVAL_S: "300"
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python automation/batch_render.py \
+            --mode worker \
+            --plan batch_state/pending.json \
+            --shard-index "${{ matrix.shard }}" \
+            --shard-total "${{ needs.prepare.outputs.num_workers }}" \
+            --max-runtime-seconds "${{ inputs.max_runtime_seconds }}" \
+            --width 1920 \
+            --height 1200 \
+            --fps 60 \
+            --crf 10 \
+            --preset-x264 slow \
+            --commit-batch 5 \
+            --report "batch_state/reports/worker_report_${{ matrix.shard }}.json"
+
+      - name: Upload worker report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-report-${{ matrix.shard }}
+          path: batch_state/reports/worker_report_${{ matrix.shard }}.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  finalize_and_continue:
+    needs: [prepare, render_worker]
+    if: always() && needs.prepare.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download batch bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: batch-bundle
+
+      - name: Download worker reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: worker-report-*
+          path: batch_state/reports
+          merge-multiple: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install HF coordinator dependency
+        run: pip install --no-cache-dir huggingface_hub>=0.25.0
+
+      - name: Merge logs, audit HF repo & check completion
+        id: merge
+        env:
+          PYTHONUNBUFFERED: "1"
+          FAHH_LOG_INTERVAL_S: "300"
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python automation/batch_render.py \
+            --mode merge \
+            --plan batch_state/pending.json \
+            --reports-dir batch_state/reports
+
+      - name: Cooldown 1 hour and continue until all 1517 MP4s complete
+        if: steps.merge.outputs.should_continue == 'true' && !cancelled()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TOTAL="${{ steps.merge.outputs.total_count }}"
+          VERIFIED="${{ steps.merge.outputs.verified_count }}"
+          REMAINING="${{ steps.merge.outputs.remaining_count }}"
+          WAIT_S="${{ inputs.cooldown_seconds }}"
+          echo "Progress: ${VERIFIED}/${TOTAL} verified (${REMAINING} remaining)."
+          echo "Waiting ${WAIT_S}s (1 hour) before launching continuation run..."
+          ELAPSED=0
+          STEP=300
+          while [ "$ELAPSED" -lt "$WAIT_S" ]; do
+            REM=$((WAIT_S - ELAPSED))
+            if [ "$REM" -lt "$STEP" ]; then
+              sleep "$REM"
+              ELAPSED="$WAIT_S"
+            else
+              sleep "$STEP"
+              ELAPSED=$((ELAPSED + STEP))
+            fi
+            echo "Cooldown heartbeat: ${ELAPSED}/${WAIT_S}s elapsed"
+          done
+          echo "Dispatching continuation workflow run..."
+          gh workflow run batch-render.yml \
+            --repo "${{ github.repository }}" \
+            --ref "${{ github.ref_name }}" \
+            -f source_repo="${{ inputs.source_repo }}" \
+            -f target_repo="${{ inputs.target_repo }}" \
+            -f max_workers="${{ inputs.max_workers }}" \
+            -f max_runtime_seconds="${{ inputs.max_runtime_seconds }}" \
+            -f cooldown_seconds="${{ inputs.cooldown_seconds }}"
